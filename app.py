@@ -1,120 +1,200 @@
 import streamlit as st
-from ultralytics import YOLO
 import cv2
+import numpy as np
+from PIL import Image
+from ultralytics import YOLO
+import shutil
+import tempfile
+from pathlib import Path
 import os
+
+# ================= CONFIG =================
 from pathlib import Path
 import tempfile
-import shutil
+import os
 
-try:
-    # Load model from file in same folder - using Path for proper path handling
-    model_path = Path(__file__).parent / "ecoli_detector.pt"
-    st.write(f"Looking for model at: {model_path}")
-    
-    if not model_path.exists():
-        st.error(f"Model file not found at {model_path}. Please check if the model file exists in the application folder.")
-        st.stop()
-    
-    # Print model file size for verification
-    st.write(f"Model file size: {model_path.stat().st_size / (1024*1024):.2f} MB")
-    
-    # Load the model with debug info
-    st.write("Loading model...")
-    model = YOLO(str(model_path))
-    st.write("Model loaded successfully!")
-    
-except Exception as e:
-    st.error(f"Error loading model: {str(e)}\nModel path: {model_path}")
+APP_DIR = Path(__file__).parent
+
+MODEL_INFOS = [
+    {"path": APP_DIR / "ecoli_detector.pt", "name": "E_coli"},
+    {"path": APP_DIR / "camper_model_best.pt", "name": "Campher"},
+    {"path": APP_DIR / "staphy_model_best.pt", "name": "Staphylococcus"},
+    {"path": APP_DIR / "bacillus_model_best.pt", "name": "Bacillus"},
+]
+
+# Validate model files
+AVAILABLE_MODELS = []
+for model_info in MODEL_INFOS:
+    if Path(model_info["path"]).exists():
+        AVAILABLE_MODELS.append(model_info)
+    else:
+        st.warning(f"Model file not found: {model_info['path']}")
+
+if not AVAILABLE_MODELS:
+    st.error("No model files found. Please check the model paths.")
     st.stop()
 
-st.title("🧫 Bacteria Detection & Growth Estimation")
+CONF_THR = 0.25
+IOU_DEDUPE = 0.5
 
-# Create a temporary directory for our files
-temp_dir = tempfile.mkdtemp()
+# Create a temporary directory for uploads
+TEMP_DIR = Path(tempfile.mkdtemp())
+# ===========================================
+
+# Utility functions
+def xyxy_area(xyxy):
+    x1,y1,x2,y2 = xyxy
+    return max(0, x2-x1) * max(0, y2-y1)
+
+def iou(boxA, boxB):
+    xA = max(boxA[0], boxB[0]); yA = max(boxA[1], boxB[1])
+    xB = min(boxA[2], boxB[2]); yB = min(boxA[3], boxB[3])
+    interW = max(0, xB-xA); interH = max(0, yB-yA)
+    interArea = interW*interH
+    boxAArea = xyxy_area(boxA); boxBArea = xyxy_area(boxB)
+    union = boxAArea + boxBArea - interArea
+    return interArea / union if union>0 else 0
+
+@st.cache_resource
+def load_models():
+    """Load all available models once and cache them"""
+    models = {}
+    for m in AVAILABLE_MODELS:
+        try:
+            models[m["name"]] = {"model": YOLO(str(m["path"])), "info": m}
+        except Exception as e:
+            st.warning(f"Failed to load model {m['name']}: {str(e)}")
+    return models
+
+def run_detection(image_path):
+    try:
+        img = cv2.imread(str(image_path))
+        if img is None:
+            raise ValueError("Failed to load image")
+        
+        h, w = img.shape[:2]
+        if h == 0 or w == 0:
+            raise ValueError("Invalid image dimensions")
+
+        all_dets = []
+        models = load_models()
+
+        # Run all models
+        for model_name, model_data in models.items():
+            try:
+                results = model_data["model"].predict(str(image_path), conf=CONF_THR, save=False)
+                for r in results:
+                    if not hasattr(r.boxes, "xyxy") or len(r.boxes) == 0:
+                        continue
+                        
+                    xyxy_arr = r.boxes.xyxy.cpu().numpy()
+                    confs = r.boxes.conf.cpu().numpy()
+                    
+                    for i, box in enumerate(xyxy_arr):
+                        conf = float(confs[i])
+                        if conf < CONF_THR:
+                            continue
+                        all_dets.append({
+                            "name": model_data["info"]["name"],
+                            "conf": conf,
+                            "xyxy": [float(v) for v in box],
+                        })
+            except Exception as e:
+                st.warning(f"Error running detection with model {model_name}: {str(e)}")
+                continue
+
+        # Deduplicate
+        final_dets = []
+        used = [False]*len(all_dets)
+        for i, d in enumerate(all_dets):
+            if used[i]: continue
+            boxA = d["xyxy"]
+            best = d
+            used[i] = True
+            for j in range(i+1, len(all_dets)):
+                if used[j]: continue
+                boxB = all_dets[j]["xyxy"]
+                if iou(boxA, boxB) > IOU_DEDUPE:
+                    if all_dets[j]["conf"] > best["conf"]:
+                        best = all_dets[j]
+                    used[j] = True
+            final_dets.append(best)
+
+        # Draw detections
+        for det in final_dets:
+            x1,y1,x2,y2 = map(int, det["xyxy"])
+            cv2.rectangle(img, (x1,y1), (x2,y2), (0,255,0), 2)
+            cv2.putText(img, f"{det['name']} {det['conf']:.2f}", (x1, y1-10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 2)
+
+        # Analysis
+        counts = {}
+        areas = {}
+        for det in final_dets:
+            counts[det["name"]] = counts.get(det["name"], 0) + 1
+            areas[det["name"]] = areas.get(det["name"], 0) + xyxy_area(det["xyxy"])
+        total_area = sum(areas.values())
+
+        analysis = {}
+        for name in counts:
+            perc = (areas[name]/total_area*100) if total_area>0 else 0
+            analysis[name] = {"count": counts[name], "percentage": perc}
+
+        return img, analysis
+        
+    except Exception as e:
+        st.error(f"Error in detection process: {str(e)}")
+        return None, {}
+
+# Cleanup function for temporary files
+def cleanup_temp_files():
+    try:
+        if TEMP_DIR.exists():
+            shutil.rmtree(TEMP_DIR)
+    except Exception as e:
+        st.warning(f"Failed to cleanup temporary files: {str(e)}")
+
+# ===== Streamlit UI =====
 try:
-    uploaded_file = st.file_uploader("Upload a Petri Dish Image", type=["jpg", "png", "jpeg"])
+    st.title("🦠 Multi-Bacteria Detection App")
+
+    # Show available models
+    st.sidebar.subheader("Available Models:")
+    for model in AVAILABLE_MODELS:
+        st.sidebar.text(f"✓ {model['name']}")
+
+    uploaded_file = st.file_uploader("Upload Petri Dish Image", type=["jpg","png","jpeg"])
 
     if uploaded_file:
-        # Save uploaded file temporarily with proper path handling
-        temp_image_path = Path(temp_dir) / "input_image.jpg"
-        
         try:
-            # Save the uploaded file
-            with open(temp_image_path, "wb") as f:
-                f.write(uploaded_file.getbuffer())
+            # Create a unique temporary file path
+            temp_path = TEMP_DIR / f"{uploaded_file.name}"
+            
+            # Save uploaded image temporarily
+            img = Image.open(uploaded_file)
+            img.save(temp_path)
 
-            # Validate image
-            img = cv2.imread(str(temp_image_path))
-            if img is None:
-                st.error("Failed to load the uploaded image. Please try again with a different image.")
-                st.stop()
+            st.image(img, caption="Uploaded Image", use_column_width=True)
 
-            # Run detection with error handling
-            try:
-                st.write("Running detection...")
-                st.write(f"Input image path: {temp_image_path}")
-                
-                results = model(str(temp_image_path), save=True, project="runs", name="detect")
-                st.write("Detection completed!")
-                st.write(f"Results type: {type(results)}")
-                st.write(f"Number of detections: {len(results) if results else 0}")
-                
-                if not results or len(results) == 0:
-                    st.warning("No colonies detected in the image.")
-                    st.image(str(temp_image_path), caption="Original Image")
-                    st.stop()
-
-                # Calculate growth %
-                h, w = img.shape[:2]
-                dish_area = h * w
-
-                # Get detection boxes
-                if hasattr(results[0].boxes, 'xywh') and len(results[0].boxes.xywh) > 0:
-                    total_area = sum([bw * bh for _,_,bw,bh in results[0].boxes.xywh])
-                    percentage = (total_area / dish_area) * 100
-
-                    # Show annotated output
-                    # YOLO saves results in a numbered directory like 'predict', 'predict2', etc.
-                    predict_dir = None
-                    for i in range(1, 10):  # Check predict1 through predict9
-                        suffix = '' if i == 1 else str(i)
-                        test_path = Path("runs/detect/predict" + suffix)
-                        if test_path.exists() and any(test_path.iterdir()):
-                            predict_dir = test_path
-                            break
-                    
-                    if predict_dir:
-                        # Get the latest image in the predict directory
-                        output_files = list(predict_dir.glob("*"))
-                        st.write(f"Found {len(output_files)} files in output directory: {predict_dir}")
-                        for f in output_files:
-                            st.write(f"Output file: {f}")
-                            
-                        if output_files:
-                            latest_output = max(output_files, key=lambda x: x.stat().st_mtime)
-                            st.write(f"Selected output file: {latest_output}")
-                            st.image(str(latest_output), caption="Detected Colonies")
-                            st.success(f"✅ Bacterial Growth: {percentage:.2f}%")
+            if st.button("Run Detection"):
+                with st.spinner("Running detection..."):
+                    try:
+                        result_img, analysis = run_detection(temp_path)
+                        
+                        if not analysis:
+                            st.warning("No bacteria colonies detected in the image.")
                         else:
-                            st.error("No output image found in the results directory.")
-                    else:
-                        st.error("Could not find the processed image output directory.")
-                else:
-                    st.warning("No colonies detected in the image.")
-                    st.image(str(temp_image_path), caption="Original Image")
+                            st.image(result_img, caption="Detection Result", use_column_width=True)
 
-            except Exception as e:
-                st.error(f"Error during detection: {str(e)}")
-
+                            st.subheader("Analysis:")
+                            for name, info in analysis.items():
+                                st.write(f"{name}: {info['count']} colonies, {info['percentage']:.2f}% of total area")
+                    except Exception as e:
+                        st.error(f"Error during detection: {str(e)}")
+                        
         except Exception as e:
-            st.error(f"Error processing the image: {str(e)}")
-
+            st.error(f"Error processing uploaded file: {str(e)}")
+            
 finally:
-    # Clean up temporary files
-    try:
-        shutil.rmtree(temp_dir)
-        if Path("runs").exists():
-            shutil.rmtree("runs")
-    except Exception as e:
-        st.warning(f"Warning: Could not clean up temporary files: {str(e)}")
-
+    # Cleanup temporary files when the app exits
+    cleanup_temp_files()
